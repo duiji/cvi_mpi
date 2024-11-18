@@ -1,0 +1,9 @@
+TOPTARGETS := all clean install
+
+SUBDIRS := uvc main
+
+$(TOPTARGETS): $(SUBDIRS)
+$(SUBDIRS):
+	$(MAKE) -C $@ $(MAKECMDGOALS)
+
+.PHONY: $(TOPTARGETS) $(SUBDIRS)
