@@ -43,14 +43,29 @@ const char *coco_names[] = {
 
 cvitdl_handle_t g_tdl_handle = NULL;
 cvitdl_service_handle_t g_service_handle = NULL;
-static bool s_ai_init = false;
-cvtdl_object_t g_obj_meta = {0};
+
+static cvtdl_object_t g_obj_meta = {0};
+
 static volatile double frame_cost = 0;
 static volatile double tdl_cost = 0;
 static volatile double cost = 0;
-
-//线程停的标记
 static volatile bool jobExit = false;
+static volatile bool s_ai_init = false;
+
+#define MUTEXAUTOLOCK_INIT(mutex) pthread_mutex_t AUTOLOCK_##mutex = PTHREAD_MUTEX_INITIALIZER;
+
+#define MutexAutoLock(mutex, lock)                                            \
+  __attribute__((cleanup(AutoUnLock))) pthread_mutex_t *lock = &AUTOLOCK_##mutex; \
+  pthread_mutex_lock(lock);
+
+__attribute__((always_inline)) inline void AutoUnLock(void *mutex) {
+  pthread_mutex_unlock(*(pthread_mutex_t **)mutex);
+}
+
+
+MUTEXAUTOLOCK_INIT(ResultMutex);
+
+/////////////////
 
 static bool s_uvc_init = false;
 typedef struct tagUVC_STREAM_CONTEXT_S {
@@ -347,8 +362,8 @@ void *run_tdl_thread(void *args) {
 		clock_gettime(CLOCK_MONOTONIC, &start);
 
 		//printf("---------------------to do detection-----------------------\n");
-		cvtdl_object_t temp_meta = {0};
-		memset(&temp_meta, 0, sizeof(cvtdl_object_t));
+		cvtdl_object_t stHandMeta = {0};
+		memset(&stHandMeta, 0, sizeof(cvtdl_object_t));
 
 		//帧
 		s32Ret = CVI_VPSS_GetChnFrame(0, 1, &stFrame, 2000);
@@ -360,7 +375,7 @@ void *run_tdl_thread(void *args) {
 		clock_gettime(CLOCK_MONOTONIC, &frame_time);
 
 		//算法
-		s32Ret = CVI_TDL_Detection(g_tdl_handle, &stFrame, CVI_TDL_SUPPORTED_MODEL_YOLOV8_DETECTION, &temp_meta);
+		s32Ret = CVI_TDL_Detection(g_tdl_handle, &stFrame, CVI_TDL_SUPPORTED_MODEL_YOLOV8_DETECTION, &stHandMeta);
 		//s32Ret = CVI_TDL_PersonVehicle_Detection(g_tdl_handle, &stFrame, &temp_meta);
 		if (s32Ret != CVI_SUCCESS) {
 			printf("##run_tdl_thread CVI_TDL_PersonVehicle_Detection failed with %#x! \n", s32Ret);
@@ -369,24 +384,27 @@ void *run_tdl_thread(void *args) {
 
 		//过滤得到80个类别中 人和车
 		uint32_t new_size = 0;
-		for (uint32_t i = 0; i < temp_meta.size; i++) {
-			int cls = temp_meta.info[i].classes;
+		for (uint32_t i = 0; i < stHandMeta.size; i++) {
+			int cls = stHandMeta.info[i].classes;
 			//"person" 0,        "bicycle" 1,       "car" 2,           "motorbike" 3,
     		//"aeroplane 4",     "car 5",           "train 6",         "car 7",
 			if (cls == 0 || cls == 1 || cls == 2 || cls == 3 || cls == 5 || cls == 7) {
-				temp_meta.info[new_size] = temp_meta.info[i];
-				new_size++;  // 更新新数组的大小
+				stHandMeta.info[new_size] = stHandMeta.info[i];
+				new_size++;
 			}
 		}
-		//更新 temp_meta 的大小
-		temp_meta.size = new_size;
 
-		printf("tdl thread run -detection %d \n", new_size);
+		stHandMeta.size = new_size;
+
+		//printf("tdl thread run -detection %d \n", new_size);
 		
-		CVI_TDL_CopyObjectMeta(&temp_meta, &g_obj_meta);
+		{
+			MutexAutoLock(ResultMutex, lock);
+			CVI_TDL_CopyObjectMeta(&stHandMeta, &g_obj_meta);
+		}
 
 		CVI_VPSS_ReleaseChnFrame(0, 1, &stFrame);
-		CVI_TDL_Free(&temp_meta);
+		CVI_TDL_Free(&stHandMeta);
 
 		//////////////////////////
 		clock_gettime(CLOCK_MONOTONIC, &tdl_time); // 结束计时
@@ -403,10 +421,10 @@ void *run_tdl_thread(void *args) {
 		//////////////////////////
 		detection_error:
 			CVI_VPSS_ReleaseChnFrame(0, 1, &stFrame);
-			CVI_TDL_Free(&temp_meta);
+			CVI_TDL_Free(&stHandMeta);
 		get_frame_error:
 			CVI_VPSS_ReleaseChnFrame(0, 1, &stFrame);
-			CVI_TDL_Free(&temp_meta);
+			CVI_TDL_Free(&stHandMeta);
 	}
 	
 	printf("Exit TDL thread\n");
@@ -660,36 +678,37 @@ int32_t run_ai_draw(VIDEO_FRAME_INFO_S *venc_frame){
 		return s32Ret;
 	}
 
+	cvtdl_object_t stHandMeta = {0};
+	memset(&stHandMeta, 0, sizeof(cvtdl_object_t));
+
+	{
+		MutexAutoLock(ResultMutex, lock);
+		CVI_TDL_CopyObjectMeta(&g_obj_meta, &stHandMeta);
+	}
+
 	cvtdl_service_brush_t brushi;
 	brushi.color.r = 255;
 	brushi.color.g = 0;
 	brushi.color.b = 0;
 	brushi.size = 2;
 
-	s32Ret = CVI_TDL_Service_ObjectDrawRect(g_service_handle, &g_obj_meta, venc_frame, true, brushi);
+	s32Ret = CVI_TDL_Service_ObjectDrawRect(g_service_handle, &stHandMeta, venc_frame, true, brushi);
 	if (s32Ret != CVI_SUCCESS) {
 		printf("##CVI_TDL_Service_ObjectDrawRect failed with %#x!\n", s32Ret);
 		return s32Ret;
 	}
 
-
-	for (uint32_t i = 0; i < g_obj_meta.size; i++) {
-		// printf("---- %f %f %f %f %d %f \n", g_obj_meta.info[i].bbox.x1,
-		// 	g_obj_meta.info[i].bbox.y1,
-		// 	g_obj_meta.info[i].bbox.x2,
-		// 	g_obj_meta.info[i].bbox.y2,
-		// 	g_obj_meta.info[i].classes,
-		// 	g_obj_meta.info[i].bbox.score);
-
-		// float w = g_obj_meta.info[i].bbox.x2 - g_obj_meta.info[i].bbox.x1;
-		// float h = g_obj_meta.info[i].bbox.y2 - g_obj_meta.info[i].bbox.y1;
-		// if (w < 200 || h < 100) {
-		// 	continue;
-		// }
+	for (uint32_t i = 0; i < stHandMeta.size; i++) {
+		// printf("---- %f %f %f %f %d %f \n", stHandMeta.info[i].bbox.x1,
+		// 	stHandMeta.info[i].bbox.y1,
+		// 	stHandMeta.info[i].bbox.x2,
+		// 	stHandMeta.info[i].bbox.y2,
+		// 	stHandMeta.info[i].classes,
+		// 	stHandMeta.info[i].bbox.score);
 
 		char strinfo[128];
-		sprintf(strinfo, "%s %0.2f", coco_names[g_obj_meta.info[i].classes], g_obj_meta.info[i].bbox.score);
-		s32Ret = CVI_TDL_Service_ObjectWriteText(strinfo, g_obj_meta.info[i].bbox.x1, g_obj_meta.info[i].bbox.y2, venc_frame, 0, 200, 0);
+		sprintf(strinfo, "%s %0.2f", coco_names[stHandMeta.info[i].classes], stHandMeta.info[i].bbox.score);
+		s32Ret = CVI_TDL_Service_ObjectWriteText(strinfo, stHandMeta.info[i].bbox.x1, stHandMeta.info[i].bbox.y2, venc_frame, 0, 200, 0);
 		if (s32Ret != CVI_SUCCESS) {
 			printf("##CVI_TDL_Service_ObjectWriteText failed with %#x!\n", s32Ret);
 			return s32Ret;
@@ -697,13 +716,14 @@ int32_t run_ai_draw(VIDEO_FRAME_INFO_S *venc_frame){
 	}
 
 	char info[128];
-	sprintf(info, "Detect:%d Frame:%0.1f Tdl:%0.1f Venc:%0.1f", g_obj_meta.size, frame_cost, tdl_cost, cost);
+	sprintf(info, "Detect:%d Frame:%0.1f Tdl:%0.1f Venc:%0.1f", stHandMeta.size, frame_cost, tdl_cost, cost);
 	s32Ret = CVI_TDL_Service_ObjectWriteText(info, 30, 50, venc_frame, 0, 0, 255);
 	if (s32Ret != CVI_SUCCESS) {
 		printf("##CVI_TDL_Service_ObjectWriteText failed with %#x!\n", s32Ret);
 		return s32Ret;
 	}
 
+	CVI_TDL_Free(&stHandMeta);
 	//printf("---->end!\n");
 
 	return s32Ret;
@@ -720,14 +740,14 @@ int32_t UVC_STREAM_CopyBitStream(void *dst)
 	VENC_STREAM_S stStream = {0};
 
 	struct timespec start, end;
-	clock_gettime(CLOCK_MONOTONIC, &start); // 开始计时
+	clock_gettime(CLOCK_MONOTONIC, &start);
 
 	CVI_VPSS_GetChnFrame(pstSrc->VprocHdl, pstSrc->VprocChnId, &venc_frame, 1000);
 
-	clock_gettime(CLOCK_MONOTONIC, &end); // 结束计时
+	clock_gettime(CLOCK_MONOTONIC, &end);
 
     double cost_time = (end.tv_sec - start.tv_sec) + 
-                     (end.tv_nsec - start.tv_nsec) / 1e6; // 计算耗时（ms）
+                     (end.tv_nsec - start.tv_nsec) / 1e6;
 
 	cost = cost_time < 0 ? cost : cost_time;
 
