@@ -45,7 +45,9 @@ cvitdl_handle_t g_tdl_handle = NULL;
 cvitdl_service_handle_t g_service_handle = NULL;
 static bool s_ai_init = false;
 cvtdl_object_t g_obj_meta = {0};
-static volatile double elapsed = 0;
+static volatile double frame_cost = 0;
+static volatile double tdl_cost = 0;
+static volatile double cost = 0;
 
 //线程停的标记
 static volatile bool jobExit = false;
@@ -318,9 +320,14 @@ int32_t vpss_init(void)
 	}
 
 	s32Ret = SAMPLE_COMM_VI_Bind_VPSS(0, 0, VpssGrp);
+	if (s32Ret != CVI_SUCCESS) {
+		SAMPLE_PRT("vi bind vpss ViChn 0 failed. s32Ret: 0x%x !\n", s32Ret);
+		return s32Ret;
+	}
+
 	s32Ret = SAMPLE_COMM_VI_Bind_VPSS(0, 1, VpssGrp);
 	if (s32Ret != CVI_SUCCESS) {
-		SAMPLE_PRT("vi bind vpss failed. s32Ret: 0x%x !\n", s32Ret);
+		SAMPLE_PRT("vi bind vpss ViChn 1 failed. s32Ret: 0x%x !\n", s32Ret);
 		return s32Ret;
 	}
 
@@ -332,23 +339,27 @@ int32_t vpss_init(void)
 void *run_tdl_thread(void *args) {
 	printf("---------------------run_tdl_thread-----------------------\n");
 	int32_t s32Ret = 0;
+	jobExit = false;
 	VIDEO_FRAME_INFO_S stFrame;
-	while (jobExit == false && s_ai_init == true) {
-		struct timespec start, end;
-		clock_gettime(CLOCK_MONOTONIC, &start); // 开始计时
+	
+	while (jobExit == false) {
+		struct timespec start, frame_time, tdl_time;
+		clock_gettime(CLOCK_MONOTONIC, &start);
 
 		//printf("---------------------to do detection-----------------------\n");
 		cvtdl_object_t temp_meta = {0};
 		memset(&temp_meta, 0, sizeof(cvtdl_object_t));
 
-		//获取帧
+		//帧
 		s32Ret = CVI_VPSS_GetChnFrame(0, 1, &stFrame, 2000);
 		if (s32Ret != CVI_SUCCESS) {
 			printf("run_tdl_thread CVI_VPSS_GetChnFrame failed. s32Ret: 0x%x !\n", s32Ret);
 			goto get_frame_error;
 		}
 
-		//调用算法
+		clock_gettime(CLOCK_MONOTONIC, &frame_time);
+
+		//算法
 		s32Ret = CVI_TDL_Detection(g_tdl_handle, &stFrame, CVI_TDL_SUPPORTED_MODEL_YOLOV8_DETECTION, &temp_meta);
 		//s32Ret = CVI_TDL_PersonVehicle_Detection(g_tdl_handle, &stFrame, &temp_meta);
 		if (s32Ret != CVI_SUCCESS) {
@@ -357,20 +368,20 @@ void *run_tdl_thread(void *args) {
 		}
 
 		//过滤得到80个类别中 人和车
-		uint32_t new_size = 0;  // 新的数组大小
+		uint32_t new_size = 0;
 		for (uint32_t i = 0; i < temp_meta.size; i++) {
-			//如果classId不在 filter_persion_and_car ,将 i 这个元素去掉
 			int cls = temp_meta.info[i].classes;
 			//"person" 0,        "bicycle" 1,       "car" 2,           "motorbike" 3,
     		//"aeroplane 4",     "car 5",           "train 6",         "car 7",
 			if (cls == 0 || cls == 1 || cls == 2 || cls == 3 || cls == 5 || cls == 7) {
-				// 如果在 filter 中，将该元素保留在新的位置
 				temp_meta.info[new_size] = temp_meta.info[i];
 				new_size++;  // 更新新数组的大小
 			}
 		}
 		//更新 temp_meta 的大小
 		temp_meta.size = new_size;
+
+		printf("tdl thread run -detection %d \n", new_size);
 		
 		CVI_TDL_CopyObjectMeta(&temp_meta, &g_obj_meta);
 
@@ -378,12 +389,16 @@ void *run_tdl_thread(void *args) {
 		CVI_TDL_Free(&temp_meta);
 
 		//////////////////////////
-		clock_gettime(CLOCK_MONOTONIC, &end); // 结束计时
+		clock_gettime(CLOCK_MONOTONIC, &tdl_time); // 结束计时
 
-    	double cost = (end.tv_sec - start.tv_sec) + 
-                     (end.tv_nsec - start.tv_nsec) / 1e6; // 计算耗时（ms）
+    	double frame_cost_time = (frame_time.tv_sec - start.tv_sec) + 
+                     (frame_time.tv_nsec - start.tv_nsec) / 1e6; // 计算耗时（ms）
 
-		elapsed = cost < 0 ? elapsed : cost;
+		double tdl_cost_time = (tdl_time.tv_sec - frame_time.tv_sec) + 
+                     (tdl_time.tv_nsec - frame_time.tv_nsec) / 1e6; // 计算耗时（ms）
+
+		frame_cost = frame_cost_time < 0 ? frame_cost : frame_cost_time;
+		tdl_cost = tdl_cost_time < 0 ? tdl_cost : tdl_cost_time;
 
 		//////////////////////////
 		detection_error:
@@ -395,6 +410,11 @@ void *run_tdl_thread(void *args) {
 	}
 	
 	printf("Exit TDL thread\n");
+
+	CVI_TDL_DestroyHandle(g_tdl_handle);
+	CVI_TDL_Service_DestroyHandle(g_service_handle);
+	CVI_TDL_Free(&g_obj_meta);
+
   	pthread_exit(NULL);
 }
 
@@ -439,11 +459,14 @@ int32_t ai_init(void)
         return -1;
     }
 
+	s_ai_init = true;
+
     return 0;
 }
 
 void vpss_exit()
 {
+	printf("111-vpss_exit\n");
 	if(!s_stUVCStreamCtx.bVpssStart)
 		return;
 
@@ -451,8 +474,10 @@ void vpss_exit()
 
 	VPSS_GRP VpssGrp = s_stUVCStreamCtx.stDataSource.VprocHdl;
 	SAMPLE_COMM_VI_UnBind_VPSS(0, 0, VpssGrp);
+	SAMPLE_COMM_VI_UnBind_VPSS(0, 1, VpssGrp);
 	CVI_BOOL abChnEnable[VPSS_MAX_PHY_CHN_NUM] = { 0 };
 	abChnEnable[0] = CVI_TRUE;
+	abChnEnable[1] = CVI_TRUE;
 	SAMPLE_COMM_VPSS_Stop(VpssGrp, abChnEnable);
 }
 
@@ -555,10 +580,20 @@ static int init_venc()
 
 void venc_exit()
 {
+	printf("111-venc_exit\n");
     CVI_UVC_DATA_SOURCE_S *pstSrc = &s_stUVCStreamCtx.stDataSource;
     s_stUVCStreamCtx.bVencStart = false;
     SAMPLE_COMM_VENC_Stop(pstSrc->VencHdl);
     printf("[%s] SAMPLE_COMM_VENC_Stop(%d) done\n", __FUNCTION__, pstSrc->VencHdl);
+}
+
+int32_t ai_exit(void)
+{
+	printf("111-ai_exit\n");
+	jobExit = true;
+	s_ai_init = false;
+	
+	return 0;
 }
 
 int32_t UVC_STREAM_Start(void)
@@ -587,12 +622,14 @@ int32_t UVC_STREAM_Start(void)
 		return -1;
 	}
 
+	if (s_ai_init) {
+		ai_exit();
+	}
+
 	if (0 != ai_init())
 	{
 		printf("ai_init failed !");
-	} else {
-		s_ai_init = true;
-	}
+	} 
 
 	s_stUVCStreamCtx.bInited = true;
 	
@@ -601,6 +638,7 @@ int32_t UVC_STREAM_Start(void)
 
 int32_t UVC_STREAM_Stop(void)
 {
+	printf("111-UVC_STREAM_Stop\n");
 	if (s_stUVCStreamCtx.bInited)
 	{
 		CVI_UVC_DATA_SOURCE_S *pstSrc = &s_stUVCStreamCtx.stDataSource;
@@ -608,6 +646,10 @@ int32_t UVC_STREAM_Stop(void)
 
 		s_stUVCStreamCtx.bInited = false;
 	}
+
+	//退出tdl job
+	jobExit = true;
+
 	return 0;
 }
 
@@ -654,15 +696,13 @@ int32_t run_ai_draw(VIDEO_FRAME_INFO_S *venc_frame){
 		}
 	}
 
-	/*
 	char info[128];
-	sprintf(info, "Detect:%d Cost:%0.1f", g_obj_meta.size, elapsed);
+	sprintf(info, "Detect:%d Frame:%0.1f Tdl:%0.1f Venc:%0.1f", g_obj_meta.size, frame_cost, tdl_cost, cost);
 	s32Ret = CVI_TDL_Service_ObjectWriteText(info, 30, 50, venc_frame, 0, 0, 255);
 	if (s32Ret != CVI_SUCCESS) {
 		printf("##CVI_TDL_Service_ObjectWriteText failed with %#x!\n", s32Ret);
 		return s32Ret;
 	}
-	*/
 
 	//printf("---->end!\n");
 
@@ -679,8 +719,18 @@ int32_t UVC_STREAM_CopyBitStream(void *dst)
 	VIDEO_FRAME_INFO_S venc_frame;
 	VENC_STREAM_S stStream = {0};
 
+	struct timespec start, end;
+	clock_gettime(CLOCK_MONOTONIC, &start); // 开始计时
 
 	CVI_VPSS_GetChnFrame(pstSrc->VprocHdl, pstSrc->VprocChnId, &venc_frame, 1000);
+
+	clock_gettime(CLOCK_MONOTONIC, &end); // 结束计时
+
+    double cost_time = (end.tv_sec - start.tv_sec) + 
+                     (end.tv_nsec - start.tv_nsec) / 1e6; // 计算耗时（ms）
+
+	cost = cost_time < 0 ? cost : cost_time;
+
 
 	///////////////////////////
 	//画图
@@ -717,6 +767,12 @@ int32_t UVC_STREAM_CopyBitStream(void *dst)
 		return -1;
 	}
 
+	//char *w_ptr;
+	//FILE *fp = fopen("/mnt/data/nfs/dump.h265", "a");
+	//if(!fp) {
+	//	printf("open file fail\n");
+	//}
+
 	stStream.pstPack = (VENC_PACK_S *)malloc(sizeof(VENC_PACK_S) * stStat.u32CurPacks);
 	if (stStream.pstPack == NULL)
 	{
@@ -741,7 +797,12 @@ int32_t UVC_STREAM_CopyBitStream(void *dst)
 
 		memcpy(dst + bitstream_size, ppack->pu8Addr + ppack->u32Offset, ppack->u32Len - ppack->u32Offset);
 		bitstream_size += ppack->u32Len - ppack->u32Offset;
+
+		//w_ptr = (char *)ppack->pu8Addr;
+		//fwrite(w_ptr, ppack->u32Len, 1, fp);
 	}
+
+	//fclose(fp);
 
 	s32Ret = CVI_VENC_ReleaseStream(pstSrc->VencHdl, &stStream);
 	if (s32Ret != 0)
@@ -836,6 +897,7 @@ static int32_t UVC_LoadMod(void)
 
 static int32_t UVC_UnLoadMod(void)
 {
+	printf("111-UVC_UnLoadMod\n");
 	// printf("Do nothing now, due to the ko can NOT rmmod successfully!");
 	// cvi_rmmod(CVI_KOMOD_PATH "/videobuf2-memops.ko");
 	// cvi_rmmod(CVI_KOMOD_PATH "/videobuf2-vmalloc.ko");
@@ -873,20 +935,9 @@ int32_t UVC_Init(const CVI_UVC_DEVICE_CAP_S *pstCap, const CVI_UVC_DATA_SOURCE_S
 	return 0;
 }
 
-int32_t ai_exit(void)
-{
-	jobExit = true;
-	s_ai_init = false;
-	
-	CVI_TDL_DestroyHandle(g_tdl_handle);
-	CVI_TDL_Service_DestroyHandle(g_service_handle);
-	CVI_TDL_Free(&g_obj_meta);
-
-	return 0;
-}
-
 int32_t UVC_Deinit(void)
 {
+	printf("111-UVC_Deinit\n");
 	UVC_UnLoadMod(); // TODO, Not work right now
 
 	return 0;
@@ -925,6 +976,7 @@ int32_t UVC_Start(const char *pDevPath)
 
 int32_t UVC_Stop(void)
 {
+	printf("111-UVC_Stop\n");
 	if (false == s_stUVCCtx.bRun)
 	{
 		printf("UVC not run\n");
@@ -995,6 +1047,7 @@ failed:
 
 void uvc_exit(void)
 {
+	printf("111-uvc_exit\n");
 	if(!s_uvc_init)
 	{
 		printf("uvc not init\n");
