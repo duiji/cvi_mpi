@@ -20,7 +20,7 @@ UVC_LIB		=	$(UVC_PATH)/lib/
 
 INCS		+= -I$(MW_INC) -I$(SENSOR_LIST_INC) -I$(COMM_INC) -I$(ISP_INC) -I$(UVC_INC) -I$(KERNEL_INC) 
 LIBS 		+= -L$(UVC_LIB) -lcvi_uvc 
-LIBS 		+= -L$(MW_LIB) -Wl,-Bstatic -Wl,--start-group -lsample -lcvi_bin -lcvi_bin_isp -lvi -lvpss -lvo -lvenc -latomic -lcvi_tdl -lcvikernel -lcnpy -lcvimath -lcviruntime  -lcvi_ive -lz 
+LIBS 		+= -L$(MW_LIB) -Wl,-Bstatic -Wl,--start-group -lsample -lcvi_bin -lcvi_bin_isp -lvi -lvpss -lvo -lvenc -latomic -lcvi_tdl -lcvikernel -lcnpy -lcvimath -lcviruntime  -lcvi_ive -lz -lzbar 
 LIBS 		+=  -lsys -lsns_full $(ISP_LIB) -L$(MW_LIB)/3rd/ -lini -Wl,--end-group -Wl,-Bdynamic
 LIBS 		+= -lpthread -lm
 

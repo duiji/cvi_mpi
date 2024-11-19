@@ -12,6 +12,7 @@
 #include "cvi_tdl.h"
 #include "cvi_tdl_media.h"
 #include "core/utils/vpss_helper.h"
+#include <zbar.h>
 
 #define     VI_FPS                      30
 #define     SLOW_FPS                    15
@@ -19,7 +20,33 @@
 #define CVI_KOMOD_PATH "/mnt/system/ko"
 #define CVI_UVC_SCRIPTS_PATH "/etc"
 
-static const char *coco_names[] = {"code"};
+//////////////////////////////////
+#define MUTEXAUTOLOCK_INIT(mutex) pthread_mutex_t AUTOLOCK_##mutex = PTHREAD_MUTEX_INITIALIZER;
+
+#define MutexAutoLock(mutex, lock)                                            \
+  __attribute__((cleanup(AutoUnLock))) pthread_mutex_t *lock = &AUTOLOCK_##mutex; \
+  pthread_mutex_lock(lock);
+
+__attribute__((always_inline)) inline void AutoUnLock(void *mutex) {
+  pthread_mutex_unlock(*(pthread_mutex_t **)mutex);
+}
+
+
+MUTEXAUTOLOCK_INIT(ResultMutex);
+
+cvitdl_handle_t g_tdl_handle = NULL;
+cvitdl_service_handle_t g_service_handle = NULL;
+imgprocess_t g_img_handle = NULL;
+
+static cvtdl_object_t g_obj_meta = {0};
+
+static volatile bool s_ai_init = false;
+static volatile bool jobExit = false;
+
+static volatile double zbar_cost = 0;
+static volatile double tdl_cost = 0;
+static volatile double frame_cost = 0;
+//////////////////////////////////
 
 static bool s_uvc_init = false;
 typedef struct tagUVC_STREAM_CONTEXT_S {
@@ -56,10 +83,12 @@ static int init_vproc()
 	CVI_UVC_DATA_SOURCE_S *pstSrc = &s_stUVCStreamCtx.stDataSource;
 	VPSS_CHN_ATTR_S stChnAttr;
 	CVI_VPSS_GetChnAttr(pstSrc->VprocHdl, pstSrc->VprocChnId, &stChnAttr);
+	CVI_VPSS_GetChnAttr(pstSrc->VprocHdl, pstSrc->VprocTdlChnId, &stChnAttr);
 
 	stChnAttr.u32Width = pAttr->u32Width;
 	stChnAttr.u32Height = pAttr->u32Height;
 	CVI_VPSS_SetChnAttr(pstSrc->VprocHdl, pstSrc->VprocChnId, &stChnAttr);
+	CVI_VPSS_SetChnAttr(pstSrc->VprocHdl, pstSrc->VprocTdlChnId, &stChnAttr);
 
 	return 0;
 }
@@ -224,6 +253,180 @@ void vi_exit(void)
 	SAMPLE_COMM_VI_DestroyVi(&s_stMwCtx.stViConfig);
 }
 
+void *run_tdl_thread(void *args) {
+	printf("---------------------run_tdl_thread-----------------------\n");
+	int32_t s32Ret = 0;
+	jobExit = false;
+	VIDEO_FRAME_INFO_S stFrame;
+	while (jobExit == false) {
+		struct timespec start, frame_time, tdl_time, zbar_time;
+		//printf("---------------------to do detection-----------------------\n");
+		cvtdl_object_t stHandMeta = {0};
+		memset(&stHandMeta, 0, sizeof(cvtdl_object_t));
+
+		clock_gettime(CLOCK_MONOTONIC, &start);
+
+		//帧
+		//s32Ret = CVI_VPSS_GetChnFrame(0, 1, &stFrame, 2000);
+		//if (s32Ret != CVI_SUCCESS) {
+		//	printf("run_tdl_thread CVI_VPSS_GetChnFrame failed. s32Ret: 0x%x !\n", s32Ret);
+		//	goto get_frame_error;
+		//}
+
+		//模拟读图片
+		s32Ret = CVI_TDL_ReadImage(g_img_handle, "/mnt/data/nfs/model/book.jpg", &stFrame, PIXEL_FORMAT_RGB_888_PLANAR);
+		if (s32Ret != CVI_SUCCESS) {
+			printf("run_tdl_thread CVI_TDL_ReadImage failed. s32Ret: 0x%x !\n", s32Ret);
+			goto get_frame_error;
+		}
+
+		clock_gettime(CLOCK_MONOTONIC, &frame_time);
+
+		//算法
+		s32Ret = CVI_TDL_Detection_Windows(g_tdl_handle, &stFrame, CVI_TDL_SUPPORTED_MODEL_YOLOV8_DETECTION, &stHandMeta);
+		if (s32Ret != CVI_SUCCESS) {
+			printf("##run_tdl_thread CVI_TDL_Detection_Windows failed with %#x! \n", s32Ret);
+			goto detection_error;
+		}
+
+		clock_gettime(CLOCK_MONOTONIC, &tdl_time);
+
+		printf("tdl thread run -detection %d \n", stHandMeta.size);
+
+		for (uint32_t i = 0; i < stHandMeta.size; i++) {
+
+		}
+
+		clock_gettime(CLOCK_MONOTONIC, &zbar_time);
+		
+		{
+      		MutexAutoLock(ResultMutex, lock);
+      		CVI_TDL_CopyObjectMeta(&stHandMeta, &g_obj_meta);
+    	}
+
+		//CVI_VPSS_ReleaseChnFrame(0, 1, &stFrame);
+		CVI_TDL_ReleaseImage(g_img_handle, &stFrame);	
+		CVI_TDL_Free(&stHandMeta);
+
+		//////////////////////////
+		double frame_cost_time = (frame_time.tv_sec - start.tv_sec) + 
+                     (frame_time.tv_nsec - start.tv_nsec) / 1e6;
+
+    	double tdl_cost_time = (tdl_time.tv_sec - frame_time.tv_sec) + 
+                     (tdl_time.tv_nsec - frame_time.tv_nsec) / 1e6;
+
+		double zbar_cost_time = (zbar_time.tv_sec - tdl_time.tv_sec) + 
+                     (zbar_time.tv_nsec - tdl_time.tv_nsec) / 1e6;
+
+		frame_cost = frame_cost_time < 0 ? frame_cost : frame_cost_time;
+		tdl_cost = tdl_cost_time < 0 ? tdl_cost : tdl_cost_time;
+		zbar_cost = zbar_cost_time < 0 ? zbar_cost : zbar_cost_time;
+		//////////////////////////
+		detection_error:
+			//CVI_VPSS_ReleaseChnFrame(0, 1, &stFrame);
+			CVI_TDL_ReleaseImage(g_img_handle, &stFrame);
+			CVI_TDL_Free(&stHandMeta);
+		get_frame_error:
+			//CVI_VPSS_ReleaseChnFrame(0, 1, &stFrame);
+			CVI_TDL_ReleaseImage(g_img_handle, &stFrame);	
+			CVI_TDL_Free(&stHandMeta);
+	}
+	
+	printf("Exit TDL thread\n");
+
+	CVI_TDL_DestroyHandle(g_tdl_handle);
+	CVI_TDL_Service_DestroyHandle(g_service_handle);
+	CVI_TDL_Destroy_ImageProcessor(g_img_handle);
+	CVI_TDL_Free(&g_obj_meta);
+
+  	pthread_exit(NULL);
+}
+
+CVI_S32 init_algo_param(void) {
+	InputPreParam preprocess_cfg = CVI_TDL_GetPreParam(g_tdl_handle, CVI_TDL_SUPPORTED_MODEL_YOLOV8_DETECTION);
+
+	for (int i = 0; i < 3; i++) {
+		//printf("asign val %d \n", i);
+		preprocess_cfg.factor[i] = 0.003922;
+		preprocess_cfg.mean[i] = 0.0;
+	}
+	preprocess_cfg.format = PIXEL_FORMAT_RGB_888_PLANAR;
+
+	//printf("setup yolov8 param \n");
+	CVI_S32 ret = CVI_TDL_SetPreParam(g_tdl_handle, CVI_TDL_SUPPORTED_MODEL_YOLOV8_DETECTION, preprocess_cfg);
+	if (ret != CVI_SUCCESS) {
+		printf("Can not set yolov8 preprocess parameters %#x\n", ret);
+		return ret;
+	}
+
+	// setup yolo algorithm preprocess
+	cvtdl_det_algo_param_t yolov8_param = CVI_TDL_GetDetectionAlgoParam(g_tdl_handle, CVI_TDL_SUPPORTED_MODEL_YOLOV8_DETECTION);
+	yolov8_param.cls = 1;
+
+	//printf("setup yolov8 algorithm param \n");
+	ret = CVI_TDL_SetDetectionAlgoParam(g_tdl_handle, CVI_TDL_SUPPORTED_MODEL_YOLOV8_DETECTION, yolov8_param);
+	if (ret != CVI_SUCCESS) {
+		printf("Can not set yolov8 algorithm parameters %#x\n", ret);
+		return ret;
+	}
+
+	// set theshold
+	CVI_TDL_SetModelThreshold(g_tdl_handle, CVI_TDL_SUPPORTED_MODEL_YOLOV8_DETECTION, 0.25);
+	CVI_TDL_SetModelNmsThreshold(g_tdl_handle, CVI_TDL_SUPPORTED_MODEL_YOLOV8_DETECTION, 0.25);
+
+	return ret;
+}
+
+
+int32_t ai_init(void)
+{
+	printf("111-ai_init\n");
+	int32_t s32Ret = 0;
+	s32Ret = CVI_TDL_CreateHandle(&g_tdl_handle);
+	if (s32Ret != CVI_SUCCESS) {
+		printf("Create tdl handle failed with %#x!\n", s32Ret);
+		return -1;
+	}
+
+	s32Ret = CVI_TDL_Service_CreateHandle(&g_service_handle, g_tdl_handle);
+	if (s32Ret != CVI_SUCCESS) {
+		printf("CVI_TDL_Service_CreateHandle failed with %#x!\n", s32Ret);
+		return -1;
+	}
+
+	s32Ret = CVI_TDL_Create_ImageProcessor(&g_img_handle);
+	if (s32Ret != CVI_SUCCESS) {
+		printf("CVI_TDL_Create_ImageProcessor failed with %#x!\n", s32Ret);
+		return -1;
+	}
+	
+	//printf("---------------------openmodel-----------------------");
+	s32Ret = init_algo_param();
+	if (s32Ret != CVI_SUCCESS) {
+		printf("init_param failed with %#x!\n", s32Ret);
+		return -1;
+	}
+
+	s32Ret = CVI_TDL_OpenModel(g_tdl_handle, CVI_TDL_SUPPORTED_MODEL_YOLOV8_DETECTION, "/mnt/data/nfs/model/yolov8n_qr_code_cv181x_int8.cvimodel");
+	if (s32Ret != CVI_SUCCESS) {
+		printf("open model failed with %#x!\n", s32Ret);
+		return -1;
+	}
+
+  	memset(&g_obj_meta, 0, sizeof(cvtdl_object_t));
+
+	//线程
+	pthread_t stTDLThread;
+    if (pthread_create(&stTDLThread, NULL, run_tdl_thread, NULL) != 0) {
+        perror("Failed to create thread");
+        return -1;
+    }
+
+	s_ai_init = true;
+
+    return 0;
+}
+
 int32_t vpss_init(void)
 {
 	VPSS_GRP VpssGrp = s_stUVCStreamCtx.stDataSource.VprocHdl;
@@ -242,7 +445,7 @@ int32_t vpss_init(void)
 	VPSS_CHN_ATTR_S astVpssChnAttr[VPSS_MAX_PHY_CHN_NUM] = {0};
 	CVI_S32 s32Ret = CVI_SUCCESS;
 
-	for (VpssChn = 0; VpssChn < 1; VpssChn++)
+	for (VpssChn = 0; VpssChn < 2; VpssChn++)
 	{
 		abChnEnable[VpssChn] = CVI_TRUE;
 		astVpssChnAttr[VpssChn].u32Width                    = s_stUVCStreamCtx.stStreamAttr.u32Width;
@@ -281,7 +484,13 @@ int32_t vpss_init(void)
 
 	s32Ret = SAMPLE_COMM_VI_Bind_VPSS(0, 0, VpssGrp);
 	if (s32Ret != CVI_SUCCESS) {
-		SAMPLE_PRT("vi bind vpss failed. s32Ret: 0x%x !\n", s32Ret);
+		SAMPLE_PRT("vi bind vpss 0 failed. s32Ret: 0x%x !\n", s32Ret);
+		return s32Ret;
+	}
+
+	s32Ret = SAMPLE_COMM_VI_Bind_VPSS(0, 1, VpssGrp);
+	if (s32Ret != CVI_SUCCESS) {
+		SAMPLE_PRT("vi bind vpss 1 failed. s32Ret: 0x%x !\n", s32Ret);
 		return s32Ret;
 	}
 
@@ -299,8 +508,10 @@ void vpss_exit()
 
 	VPSS_GRP VpssGrp = s_stUVCStreamCtx.stDataSource.VprocHdl;
 	SAMPLE_COMM_VI_UnBind_VPSS(0, 0, VpssGrp);
+	SAMPLE_COMM_VI_UnBind_VPSS(0, 1, VpssGrp);
 	CVI_BOOL abChnEnable[VPSS_MAX_PHY_CHN_NUM] = { 0 };
 	abChnEnable[0] = CVI_TRUE;
+	abChnEnable[1] = CVI_TRUE;
 	SAMPLE_COMM_VPSS_Stop(VpssGrp, abChnEnable);
 }
 
@@ -408,6 +619,15 @@ void venc_exit()
     printf("[%s] SAMPLE_COMM_VENC_Stop(%d) done\n", __FUNCTION__, pstSrc->VencHdl);
 }
 
+int32_t ai_exit(void)
+{
+	printf("111-ai_exit\n");
+	jobExit = true;
+	s_ai_init = false;
+	
+	return 0;
+}
+
 int32_t UVC_STREAM_Start(void)
 {
 	if(s_stUVCStreamCtx.bVpssStart)
@@ -433,6 +653,12 @@ int32_t UVC_STREAM_Start(void)
 		return -1;
 	}
 
+	if (0 != ai_init())
+	{
+		printf("ai_init failed !");
+	} 
+
+
 	s_stUVCStreamCtx.bInited = true;
 
 	return 0;
@@ -447,191 +673,70 @@ int32_t UVC_STREAM_Stop(void)
 
 		s_stUVCStreamCtx.bInited = false;
 	}
+
+	//退出tdl job
+	jobExit = true;
+
 	return 0;
 }
 
-// set preprocess and algorithm param for yolov8 detection
-// if use official model, no need to change param
-CVI_S32 init_param(const cvitdl_handle_t tdl_handle) {
-  // setup preprocess
-  InputPreParam preprocess_cfg =
-      CVI_TDL_GetPreParam(tdl_handle, CVI_TDL_SUPPORTED_MODEL_YOLOV8_DETECTION);
-
-  for (int i = 0; i < 3; i++) {
-    //printf("asign val %d \n", i);
-    preprocess_cfg.factor[i] = 0.003922;
-    preprocess_cfg.mean[i] = 0.0;
-  }
-  preprocess_cfg.format = PIXEL_FORMAT_RGB_888_PLANAR;
-
-  //printf("setup yolov8 param \n");
-  CVI_S32 ret =
-      CVI_TDL_SetPreParam(tdl_handle, CVI_TDL_SUPPORTED_MODEL_YOLOV8_DETECTION, preprocess_cfg);
-  if (ret != CVI_SUCCESS) {
-    printf("Can not set yolov8 preprocess parameters %#x\n", ret);
-    return ret;
-  }
-
-  // setup yolo algorithm preprocess
-  cvtdl_det_algo_param_t yolov8_param =
-      CVI_TDL_GetDetectionAlgoParam(tdl_handle, CVI_TDL_SUPPORTED_MODEL_YOLOV8_DETECTION);
-  yolov8_param.cls = 1;
-
-  //printf("setup yolov8 algorithm param \n");
-  ret = CVI_TDL_SetDetectionAlgoParam(tdl_handle, CVI_TDL_SUPPORTED_MODEL_YOLOV8_DETECTION,
-                                      yolov8_param);
-  if (ret != CVI_SUCCESS) {
-    printf("Can not set yolov8 algorithm parameters %#x\n", ret);
-    return ret;
-  }
-
-  // set theshold
-  CVI_TDL_SetModelThreshold(tdl_handle, CVI_TDL_SUPPORTED_MODEL_YOLOV8_DETECTION, 0.25);
-  CVI_TDL_SetModelNmsThreshold(tdl_handle, CVI_TDL_SUPPORTED_MODEL_YOLOV8_DETECTION, 0.25);
-
-  return ret;
-}
-
-int32_t run_ai(VIDEO_FRAME_INFO_S *venc_frame, VPSS_GRP VpssGrp){
-	struct timespec start, end;
-	clock_gettime(CLOCK_MONOTONIC, &start); // 开始计时
-
-	cvitdl_handle_t tdl_handle = NULL;
-	cvitdl_service_handle_t service_handle = NULL;
-
+int32_t run_ai_draw(VIDEO_FRAME_INFO_S *venc_frame){
+	//printf("111-run_ai\n");
 	int32_t s32Ret = 0;
-	s32Ret = CVI_TDL_CreateHandle(&tdl_handle);
+	if (!s_ai_init) {
+		return s32Ret;
+	}
+
+	cvtdl_object_t stHandMeta = {0};
+	memset(&stHandMeta, 0, sizeof(cvtdl_object_t));
+
+	{
+      MutexAutoLock(ResultMutex, lock);
+      CVI_TDL_CopyObjectMeta(&g_obj_meta, &stHandMeta);
+    }
+
+	cvtdl_service_brush_t brushi;
+	brushi.color.r = 255;
+	brushi.color.g = 0;
+	brushi.color.b = 0;
+	brushi.size = 2;
+
+	s32Ret = CVI_TDL_Service_ObjectDrawRect(g_service_handle, &stHandMeta, venc_frame, true, brushi);
 	if (s32Ret != CVI_SUCCESS) {
-		printf("Create tdl handle failed with %#x!\n", s32Ret);
-		return -1;
+		printf("##CVI_TDL_Service_ObjectDrawRect failed with %#x!\n", s32Ret);
+		return s32Ret;
 	}
 
-	s32Ret = CVI_TDL_Service_CreateHandle(&service_handle, tdl_handle);
-	if (s32Ret != CVI_SUCCESS) {
-		printf("CVI_TDL_Service_CreateHandle failed with %#x!\n", s32Ret);
-		return -1;
-	}
-	
-	s32Ret = init_param(tdl_handle);
-	if (s32Ret != CVI_SUCCESS) {
-		printf("init_param failed with %#x!\n", s32Ret);
-		return -1;
-	}
-	
-	//printf("---------------------openmodel-----------------------");
-	s32Ret = CVI_TDL_OpenModel(tdl_handle, CVI_TDL_SUPPORTED_MODEL_YOLOV8_DETECTION, "/mnt/data/nfs/model/yolov8n_qr_code_cv181x_int8.cvimodel");
-
-	if (s32Ret != CVI_SUCCESS) {
-		printf("open model failed with %#x!\n", s32Ret);
-		return -1;
-	}
-
-	//使用图片 begin
-	imgprocess_t img_handle;
-	CVI_TDL_Create_ImageProcessor(&img_handle);
-
-	VIDEO_FRAME_INFO_S bg;
-	s32Ret = CVI_TDL_ReadImage(img_handle, "/mnt/data/nfs/model/book.jpg", &bg, PIXEL_FORMAT_RGB_888_PLANAR);
-	if (s32Ret != CVI_SUCCESS) {
-		printf("open img failed with %#x!\n", s32Ret);
-		return -1;
-	} else {
-		printf("image read,width:%d height:%d \n", bg.stVFrame.u32Width, bg.stVFrame.u32Height);
-	}
-
-	//使用图片 end
-	
-	//printf("---------------------to do detection-----------------------\n");
-	cvtdl_object_t obj_meta = {0};
-  	memset(&obj_meta, 0, sizeof(cvtdl_object_t));
-
-	s32Ret = CVI_TDL_Detection_Windows(tdl_handle, &bg, CVI_TDL_SUPPORTED_MODEL_YOLOV8_DETECTION, &obj_meta);
-
-	if (s32Ret != CVI_SUCCESS) {
-		printf("##CVI_TDL_Detection failed with %#x! \n", s32Ret);
-		//return -1;
-	}
-
-	printf("Detect: %d \n", obj_meta.size);
-
-	//二维码解析
-	///////////////////
-	for (uint32_t i = 0; i < obj_meta.size; i++) {
-	 	printf("zbar---- %f %f %f %f %d %f %d %d\n", 
-		obj_meta.info[i].bbox.x1,
-		obj_meta.info[i].bbox.y1,
-		obj_meta.info[i].bbox.x2,
-		obj_meta.info[i].bbox.y2,
-		obj_meta.info[i].classes,
-		obj_meta.info[i].bbox.score,
-		obj_meta.width,
-		obj_meta.height
-		);
-
-		char zbarInfo[500];
-		//s32Ret = CVI_TDL_Zbar_Decode(tdl_handle, &bg, CVI_TDL_SUPPORTED_MODEL_YOLOV8_DETECTION, &obj_meta.info[i], zbarInfo);
-		printf("result: %s\n", zbarInfo);
-		break;
-	}
-
-	///////////////////
-
-	for (uint32_t i = 0; i < obj_meta.size; i++) {
-		printf("---- %f %f %f %f %d %f %d %d\n", 
-		obj_meta.info[i].bbox.x1,
-		obj_meta.info[i].bbox.y1,
-		obj_meta.info[i].bbox.x2,
-		obj_meta.info[i].bbox.y2,
-		obj_meta.info[i].classes,
-		obj_meta.info[i].bbox.score,
-		obj_meta.width,
-		obj_meta.height
-		);
-
-		cvtdl_service_brush_t brushi;
-		brushi.color.r = 255;
-		brushi.color.g = 0;
-		brushi.color.b = 0;
-		brushi.size = 2;
-
-		s32Ret = CVI_TDL_Service_ObjectDrawRect(service_handle, &obj_meta, venc_frame, false, brushi);
-		if (s32Ret != CVI_SUCCESS) {
-			printf("##CVI_TDL_Service_ObjectDrawRect failed with %#x!\n", s32Ret);
-			//return -1;
-		}
+	for (uint32_t i = 0; i < stHandMeta.size; i++) {
+		// printf("---- %f %f %f %f %d %f \n", stHandMeta.info[i].bbox.x1,
+		// 	stHandMeta.info[i].bbox.y1,
+		// 	stHandMeta.info[i].bbox.x2,
+		// 	stHandMeta.info[i].bbox.y2,
+		// 	stHandMeta.info[i].classes,
+		// 	stHandMeta.info[i].bbox.score);
 
 		char strinfo[128];
-		sprintf(strinfo, "%s %0.2f", coco_names[obj_meta.info[i].classes], obj_meta.info[i].bbox.score);
-		s32Ret = CVI_TDL_Service_ObjectWriteText(strinfo, obj_meta.info[i].bbox.x1, obj_meta.info[i].bbox.y2, venc_frame, 0, 200, 0);
+		sprintf(strinfo, "%0.2f", stHandMeta.info[i].bbox.score);
+		s32Ret = CVI_TDL_Service_ObjectWriteText(strinfo, stHandMeta.info[i].bbox.x1, stHandMeta.info[i].bbox.y2, venc_frame, 0, 200, 0);
 		if (s32Ret != CVI_SUCCESS) {
 			printf("##CVI_TDL_Service_ObjectWriteText failed with %#x!\n", s32Ret);
-			//return -1;
+			return s32Ret;
 		}
 	}
 
-	//保存图片
-
-	clock_gettime(CLOCK_MONOTONIC, &end); // 结束计时
-
-    double elapsed = (end.tv_sec - start.tv_sec) + 
-                     (end.tv_nsec - start.tv_nsec) / 1e6; // 计算耗时（秒）
-
 	char info[128];
-	sprintf(info, "Detect: %d Cost:%0.1f", obj_meta.size, elapsed);
+	sprintf(info, "Detect:%d Tdl:%0.1f Frame:%0.1f Zbar:%0.1f", stHandMeta.size, tdl_cost, frame_cost, zbar_cost);
 	s32Ret = CVI_TDL_Service_ObjectWriteText(info, 30, 50, venc_frame, 0, 0, 255);
 	if (s32Ret != CVI_SUCCESS) {
 		printf("##CVI_TDL_Service_ObjectWriteText failed with %#x!\n", s32Ret);
-		//return -1;
+		return s32Ret;
 	}
-	
-	CVI_TDL_Free(&obj_meta);
-	CVI_TDL_DestroyHandle(tdl_handle);
-	CVI_TDL_Service_DestroyHandle(service_handle);
-	CVI_TDL_ReleaseImage(img_handle, &bg);
-  	CVI_TDL_Destroy_ImageProcessor(img_handle);
+
+	CVI_TDL_Free(&stHandMeta);
+
 	//printf("---->end!\n");
 
-	return 0;
+	return s32Ret;
 }
 
 
@@ -644,9 +749,8 @@ int32_t UVC_STREAM_CopyBitStream(void *dst)
 	CVI_VPSS_GetChnFrame(pstSrc->VprocHdl, pstSrc->VprocChnId, &venc_frame, 1000);
 
 	/////////////
-	// 这边算法
-	s32Ret = run_ai(&venc_frame, pstSrc->VprocHdl);
-	/////////////
+	//画图
+	s32Ret = run_ai_draw(&venc_frame);
 
 	int32_t s32SetFrameMilliSec = 20000;
 	VENC_CHN_ATTR_S stVencChnAttr;
@@ -905,6 +1009,7 @@ int uvc_init(void)
 	stDataSource.VencHdl = 0;
 	stDataSource.VprocChnId = 0;
 	stDataSource.VprocHdl = 0;
+	stDataSource.VprocTdlChnId = 1;
 
 	if (sys_init() != 0){
 		printf("sys_init Failed !");
@@ -943,6 +1048,14 @@ void uvc_exit(void)
 	{
 		printf("uvc not init\n");
 		return;
+	}
+
+	if(!s_ai_init)
+	{
+		printf("AI not init\n");
+	} else {
+		printf("AI exit done\n");
+		ai_exit();
 	}
 
 	if (UVC_Stop() != 0)
