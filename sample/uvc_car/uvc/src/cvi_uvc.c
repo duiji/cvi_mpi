@@ -716,7 +716,8 @@ int32_t run_ai_draw(VIDEO_FRAME_INFO_S *venc_frame){
 	}
 
 	char info[128];
-	sprintf(info, "Detect:%d Frame:%0.1f Tdl:%0.1f Venc:%0.1f", stHandMeta.size, frame_cost, tdl_cost, cost);
+	//sprintf(info, "Detect:%d Frame:%0.1f Tdl:%0.1f Venc:%0.1f", stHandMeta.size, frame_cost, tdl_cost, cost);
+	sprintf(info, "Detect:%d", stHandMeta.size);
 	s32Ret = CVI_TDL_Service_ObjectWriteText(info, 30, 50, venc_frame, 0, 0, 255);
 	if (s32Ret != CVI_SUCCESS) {
 		printf("##CVI_TDL_Service_ObjectWriteText failed with %#x!\n", s32Ret);
