@@ -36,7 +36,7 @@ MUTEXAUTOLOCK_INIT(ResultMutex);
 
 cvitdl_handle_t g_tdl_handle = NULL;
 cvitdl_service_handle_t g_service_handle = NULL;
-imgprocess_t g_img_handle = NULL;
+//imgprocess_t g_img_handle = NULL;
 
 static cvtdl_object_t g_obj_meta = {0};
 
@@ -253,6 +253,11 @@ void vi_exit(void)
 	SAMPLE_COMM_VI_DestroyVi(&s_stMwCtx.stViConfig);
 }
 
+// 自定义 round 函数
+int round_to_int(double value) {
+    return (int)(value + (value >= 0 ? 0.5 : -0.5));
+}
+
 void *run_tdl_thread(void *args) {
 	printf("---------------------run_tdl_thread-----------------------\n");
 	int32_t s32Ret = 0;
@@ -267,18 +272,18 @@ void *run_tdl_thread(void *args) {
 		clock_gettime(CLOCK_MONOTONIC, &start);
 
 		//帧
-		//s32Ret = CVI_VPSS_GetChnFrame(0, 1, &stFrame, 2000);
-		//if (s32Ret != CVI_SUCCESS) {
-		//	printf("run_tdl_thread CVI_VPSS_GetChnFrame failed. s32Ret: 0x%x !\n", s32Ret);
-		//	goto get_frame_error;
-		//}
-
-		//模拟读图片
-		s32Ret = CVI_TDL_ReadImage(g_img_handle, "/mnt/data/nfs/model/book.jpg", &stFrame, PIXEL_FORMAT_RGB_888_PLANAR);
+		s32Ret = CVI_VPSS_GetChnFrame(0, 1, &stFrame, 2000);
 		if (s32Ret != CVI_SUCCESS) {
-			printf("run_tdl_thread CVI_TDL_ReadImage failed. s32Ret: 0x%x !\n", s32Ret);
+			printf("run_tdl_thread CVI_VPSS_GetChnFrame failed. s32Ret: 0x%x !\n", s32Ret);
 			goto get_frame_error;
 		}
+
+		//模拟读图片
+		// s32Ret = CVI_TDL_ReadImage(g_img_handle, "/mnt/data/nfs/model/book.jpg", &stFrame, PIXEL_FORMAT_RGB_888_PLANAR);
+		// if (s32Ret != CVI_SUCCESS) {
+		// 	printf("run_tdl_thread CVI_TDL_ReadImage failed. s32Ret: 0x%x !\n", s32Ret);
+		// 	goto get_frame_error;
+		// }
 
 		clock_gettime(CLOCK_MONOTONIC, &frame_time);
 
@@ -294,7 +299,73 @@ void *run_tdl_thread(void *args) {
 		printf("tdl thread run -detection %d \n", stHandMeta.size);
 
 		for (uint32_t i = 0; i < stHandMeta.size; i++) {
+			cvtdl_bbox_t bbox = stHandMeta.info[i].bbox;
+			uint32_t x1 = (uint32_t)floor(bbox.x1);
+			uint32_t y1 = (uint32_t)floor(bbox.y1);
+			uint32_t x2 = (uint32_t)floor(bbox.x2);
+			uint32_t y2 = (uint32_t)floor(bbox.y2);
+			uint32_t height = y2 - y1 + 1;
+			uint32_t width = x2 - x1 + 1;
 
+			if (height % 2 != 0) {
+				height += 1;
+			}
+
+			if (width % 2 != 0) {
+				width += 1;
+			}
+
+			bool result = false;
+			//缩放
+			float scale = 1;
+			while (!result && scale < 4){
+				int thre = 1;
+
+				int new_width = round_to_int(width * scale);
+    			int new_height = round_to_int(height * scale);
+
+				while (!result && thre <255) {
+					size_t data_size = new_width * new_height;
+					char* dst_img_data = (char*)malloc(data_size);
+
+					CVI_TDL_CropImage_ZbarData(&stFrame, dst_img_data, &stHandMeta.info[i], scale, thre);
+
+					// 调用zbar
+					// 创建ZBar扫描器
+					zbar_image_scanner_t *scanner = zbar_image_scanner_create();
+					zbar_image_scanner_set_config(scanner, 0, ZBAR_CFG_ENABLE, 1);
+
+					// 创建ZBar图像
+					zbar_image_t *zbar_image = zbar_image_create();
+					zbar_image_set_format(zbar_image, *(unsigned long*)"Y800");  // 灰度图格式
+					zbar_image_set_size(zbar_image, new_width, new_height);
+					
+					// 将cv::Mat数据指针传递给zbar_image
+					zbar_image_set_data(zbar_image, dst_img_data, new_width * new_height, NULL);
+
+					// 扫描图像
+					int n = zbar_scan_image(scanner, zbar_image);
+					if (n > 0) {
+						const zbar_symbol_t *symbol = zbar_image_first_symbol(zbar_image);
+						for (; symbol; symbol = zbar_symbol_next(symbol)) {
+							printf("Decoded symbol: %s %f %d\n", zbar_symbol_get_data(symbol), scale, thre);
+							result = true;
+						}
+					}
+
+					// 清理资源
+					zbar_image_destroy(zbar_image);
+					zbar_image_scanner_destroy(scanner);
+
+
+					// 处理完成后释放内存
+					free(dst_img_data);
+
+					thre += 30;
+				}
+
+				scale += 0.5;
+			}
 		}
 
 		clock_gettime(CLOCK_MONOTONIC, &zbar_time);
@@ -304,8 +375,8 @@ void *run_tdl_thread(void *args) {
       		CVI_TDL_CopyObjectMeta(&stHandMeta, &g_obj_meta);
     	}
 
-		//CVI_VPSS_ReleaseChnFrame(0, 1, &stFrame);
-		CVI_TDL_ReleaseImage(g_img_handle, &stFrame);	
+		CVI_VPSS_ReleaseChnFrame(0, 1, &stFrame);
+		//CVI_TDL_ReleaseImage(g_img_handle, &stFrame);	
 		CVI_TDL_Free(&stHandMeta);
 
 		//////////////////////////
@@ -323,12 +394,12 @@ void *run_tdl_thread(void *args) {
 		zbar_cost = zbar_cost_time < 0 ? zbar_cost : zbar_cost_time;
 		//////////////////////////
 		detection_error:
-			//CVI_VPSS_ReleaseChnFrame(0, 1, &stFrame);
-			CVI_TDL_ReleaseImage(g_img_handle, &stFrame);
+			CVI_VPSS_ReleaseChnFrame(0, 1, &stFrame);
+			//CVI_TDL_ReleaseImage(g_img_handle, &stFrame);
 			CVI_TDL_Free(&stHandMeta);
 		get_frame_error:
-			//CVI_VPSS_ReleaseChnFrame(0, 1, &stFrame);
-			CVI_TDL_ReleaseImage(g_img_handle, &stFrame);	
+			CVI_VPSS_ReleaseChnFrame(0, 1, &stFrame);
+			//CVI_TDL_ReleaseImage(g_img_handle, &stFrame);	
 			CVI_TDL_Free(&stHandMeta);
 	}
 	
@@ -336,7 +407,7 @@ void *run_tdl_thread(void *args) {
 
 	CVI_TDL_DestroyHandle(g_tdl_handle);
 	CVI_TDL_Service_DestroyHandle(g_service_handle);
-	CVI_TDL_Destroy_ImageProcessor(g_img_handle);
+	//CVI_TDL_Destroy_ImageProcessor(g_img_handle);
 	CVI_TDL_Free(&g_obj_meta);
 
   	pthread_exit(NULL);
@@ -394,11 +465,11 @@ int32_t ai_init(void)
 		return -1;
 	}
 
-	s32Ret = CVI_TDL_Create_ImageProcessor(&g_img_handle);
-	if (s32Ret != CVI_SUCCESS) {
-		printf("CVI_TDL_Create_ImageProcessor failed with %#x!\n", s32Ret);
-		return -1;
-	}
+	//s32Ret = CVI_TDL_Create_ImageProcessor(&g_img_handle);
+	//if (s32Ret != CVI_SUCCESS) {
+	//	printf("CVI_TDL_Create_ImageProcessor failed with %#x!\n", s32Ret);
+	//	return -1;
+	//}
 	
 	//printf("---------------------openmodel-----------------------");
 	s32Ret = init_algo_param();
