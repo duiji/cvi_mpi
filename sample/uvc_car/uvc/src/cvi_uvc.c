@@ -11,7 +11,7 @@
 #include "sample_comm.h"
 #include "cvi_tdl.h"
 
-
+#include "Connector.h"
 
 #define     VI_FPS                      30
 #define     SLOW_FPS                    15
@@ -21,7 +21,7 @@
 
 const char *coco_names[] = {
     "person",        "bicycle",       "car",           "motorbike",
-    "aeroplane",     "car",           "train",         "car",
+    "aeroplane",     "bus",           "train",         "truck",
     "boat",          "traffic light", "fire hydrant",  "stop sign",
     "parking meter", "bench",         "bird",          "cat",
     "dog",           "horse",         "sheep",         "cow",
@@ -88,6 +88,8 @@ typedef struct _MW_CTX_S {
 
 static MW_CTX_S s_stMwCtx;
 
+
+UART_CONNECTOR_CONTEXT_S* g_uart_ctx = NULL;
 ////////////////////////
 
 int32_t UVC_STREAM_SetAttr(UVC_STREAM_ATTR_S *pstAttr)
@@ -137,20 +139,34 @@ int32_t sys_init(void)
 {
 	printf("111-sys_init\n");
 	MMF_VERSION_S stVersion;
-	SAMPLE_INI_CFG_S	   stIniCfg = {
-		.enSource  = VI_PIPE_FRAME_SOURCE_DEV,
-		.devNum    = 1,
-		.enSnsType[0] = SONY_IMX327_MIPI_2M_30FPS_12BIT,
-		.enWDRMode[0] = WDR_MODE_NONE,
-		.s32BusId[0]  = 3,
-		.s32SnsI2cAddr[0] = -1,
-		.MipiDev[0]   = 0xFF,
-		.enSnsType[1] = SONY_IMX327_SLAVE_MIPI_2M_30FPS_12BIT,
-		.s32BusId[1]  = 3,
-		.s32SnsI2cAddr[1] = -1,
-		.MipiDev[1]   = 0xFF,
-		.u8UseMultiSns = 0,
-	};
+	// SAMPLE_INI_CFG_S	   stIniCfg = {
+	// 	.enSource  = VI_PIPE_FRAME_SOURCE_DEV,
+	// 	.devNum    = 1,
+	// 	.enSnsType[0] = SONY_IMX327_MIPI_2M_30FPS_12BIT,
+	// 	.enWDRMode[0] = WDR_MODE_NONE,
+	// 	.s32BusId[0]  = 3,
+	// 	.s32SnsI2cAddr[0] = -1,
+	// 	.MipiDev[0]   = 0xFF,
+	// 	.enSnsType[1] = SONY_IMX327_SLAVE_MIPI_2M_30FPS_12BIT,
+	// 	.s32BusId[1]  = 3,
+	// 	.s32SnsI2cAddr[1] = -1,
+	// 	.MipiDev[1]   = 0xFF,
+	// 	.u8UseMultiSns = 0,
+	// };
+	SAMPLE_INI_CFG_S stIniCfg;
+	stIniCfg.enSource  = VI_PIPE_FRAME_SOURCE_DEV;
+	stIniCfg.devNum    = 1;
+	stIniCfg.enSnsType[0] = GCORE_GC2053_MIPI_2M_30FPS_10BIT;
+	stIniCfg.enWDRMode[0] = WDR_MODE_NONE;
+	stIniCfg.s32BusId[0]  = 3;
+	stIniCfg.s32SnsI2cAddr[0] = -1;
+	stIniCfg.MipiDev[0]   = 0xFF;
+	stIniCfg.enSnsType[1] = GCORE_GC2053_MIPI_2M_30FPS_10BIT;
+	stIniCfg.s32BusId[1]  = 3;
+	stIniCfg.s32SnsI2cAddr[1] = -1;
+	stIniCfg.MipiDev[1]   = 0xFF;
+	stIniCfg.u8UseMultiSns = 0;
+
 
 	CVI_S32 s32Ret = CVI_SUCCESS;
 	PIC_SIZE_E enPicSize;
@@ -356,16 +372,17 @@ void *run_tdl_thread(void *args) {
 	int32_t s32Ret = 0;
 	jobExit = false;
 	VIDEO_FRAME_INFO_S stFrame;
-	
+	uint32_t new_size = 0;
+
 	while (jobExit == false) {
-		struct timespec start, frame_time, tdl_time;
+		struct timespec start, frame_time;
 		clock_gettime(CLOCK_MONOTONIC, &start);
 
 		//printf("---------------------to do detection-----------------------\n");
 		cvtdl_object_t stHandMeta = {0};
 		memset(&stHandMeta, 0, sizeof(cvtdl_object_t));
 
-		//帧
+		// 帧
 		s32Ret = CVI_VPSS_GetChnFrame(0, 1, &stFrame, 2000);
 		if (s32Ret != CVI_SUCCESS) {
 			printf("run_tdl_thread CVI_VPSS_GetChnFrame failed. s32Ret: 0x%x !\n", s32Ret);
@@ -374,7 +391,7 @@ void *run_tdl_thread(void *args) {
 
 		clock_gettime(CLOCK_MONOTONIC, &frame_time);
 
-		//算法
+		// 算法
 		s32Ret = CVI_TDL_Detection(g_tdl_handle, &stFrame, CVI_TDL_SUPPORTED_MODEL_YOLOV8_DETECTION, &stHandMeta);
 		//s32Ret = CVI_TDL_PersonVehicle_Detection(g_tdl_handle, &stFrame, &temp_meta);
 		if (s32Ret != CVI_SUCCESS) {
@@ -382,13 +399,13 @@ void *run_tdl_thread(void *args) {
 			goto detection_error;
 		}
 
-		//过滤得到80个类别中 人和车
-		uint32_t new_size = 0;
+		// 过滤得到80个类别中 人和车
+		new_size = 0;
 		for (uint32_t i = 0; i < stHandMeta.size; i++) {
 			int cls = stHandMeta.info[i].classes;
 			//"person" 0,        "bicycle" 1,       "car" 2,           "motorbike" 3,
-    		//"aeroplane 4",     "car 5",           "train 6",         "car 7",
-			if (cls == 0 || cls == 1 || cls == 2 || cls == 3 || cls == 5 || cls == 7) {
+    		//"aeroplane 4",     "bus 5",           "train 6",         "truck 7",
+			if (cls == 0 || cls == 1 || cls == 3 || cls == 2 || cls == 5 || cls == 7) {
 				stHandMeta.info[new_size] = stHandMeta.info[i];
 				new_size++;
 			}
@@ -397,36 +414,47 @@ void *run_tdl_thread(void *args) {
 		stHandMeta.size = new_size;
 
 		//printf("tdl thread run -detection %d \n", new_size);
-		
+
+
+		for (uint32_t i = 0; i < stHandMeta.size; i++)
+		{
+			printf("---- %f %f %f %f %d %f \n", stHandMeta.info[i].bbox.x1,
+			stHandMeta.info[i].bbox.y1,
+			stHandMeta.info[i].bbox.x2,
+			stHandMeta.info[i].bbox.y2,
+			stHandMeta.info[i].classes,
+			stHandMeta.info[i].bbox.score);
+		}
+
 		{
 			MutexAutoLock(ResultMutex, lock);
 			CVI_TDL_CopyObjectMeta(&stHandMeta, &g_obj_meta);
 		}
 
-		CVI_VPSS_ReleaseChnFrame(0, 1, &stFrame);
-		CVI_TDL_Free(&stHandMeta);
+		// CVI_VPSS_ReleaseChnFrame(0, 1, &stFrame);
+		// CVI_TDL_Free(&stHandMeta);
 
 		//////////////////////////
-		clock_gettime(CLOCK_MONOTONIC, &tdl_time); // 结束计时
+		// clock_gettime(CLOCK_MONOTONIC, &tdl_time); // 结束计时
 
-    	double frame_cost_time = (frame_time.tv_sec - start.tv_sec) + 
-                     (frame_time.tv_nsec - start.tv_nsec) / 1e6; // 计算耗时（ms）
+    	// frame_cost_time = (frame_time.tv_sec - start.tv_sec) +
+        //              (frame_time.tv_nsec - start.tv_nsec) / 1e6; // 计算耗时（ms）
 
-		double tdl_cost_time = (tdl_time.tv_sec - frame_time.tv_sec) + 
-                     (tdl_time.tv_nsec - frame_time.tv_nsec) / 1e6; // 计算耗时（ms）
+		// tdl_cost_time = (tdl_time.tv_sec - frame_time.tv_sec) +
+        //              (tdl_time.tv_nsec - frame_time.tv_nsec) / 1e6; // 计算耗时（ms）
 
-		frame_cost = frame_cost_time < 0 ? frame_cost : frame_cost_time;
-		tdl_cost = tdl_cost_time < 0 ? tdl_cost : tdl_cost_time;
+		// frame_cost = frame_cost_time < 0 ? frame_cost : frame_cost_time;
+		// tdl_cost = tdl_cost_time < 0 ? tdl_cost : tdl_cost_time;
 
 		//////////////////////////
 		detection_error:
-			CVI_VPSS_ReleaseChnFrame(0, 1, &stFrame);
-			CVI_TDL_Free(&stHandMeta);
+			// CVI_VPSS_ReleaseChnFrame(0, 1, &stFrame);
+			// CVI_TDL_Free(&stHandMeta);
 		get_frame_error:
 			CVI_VPSS_ReleaseChnFrame(0, 1, &stFrame);
 			CVI_TDL_Free(&stHandMeta);
 	}
-	
+
 	printf("Exit TDL thread\n");
 
 	CVI_TDL_DestroyHandle(g_tdl_handle);
@@ -452,16 +480,16 @@ int32_t ai_init(void)
 		printf("CVI_TDL_Service_CreateHandle failed with %#x!\n", s32Ret);
 		return -1;
 	}
-	
+
 	//s32Ret = init_param(tdl_handle);
 	if (s32Ret != CVI_SUCCESS) {
 		printf("init_param failed with %#x!\n", s32Ret);
 		return -1;
 	}
-	
+
 	//printf("---------------------openmodel-----------------------");
 	//s32Ret = CVI_TDL_OpenModel(g_tdl_handle, CVI_TDL_SUPPORTED_MODEL_PERSON_VEHICLE_DETECTION, "/mnt/data/nfs/model/yolov8n_384_640_person_vehicle.cvimodel");
-	s32Ret = CVI_TDL_OpenModel(g_tdl_handle, CVI_TDL_SUPPORTED_MODEL_YOLOV8_DETECTION, "/mnt/data/nfs/model/yolov8n_coco80_cv181x_int8.cvimodel");
+	s32Ret = CVI_TDL_OpenModel(g_tdl_handle, CVI_TDL_SUPPORTED_MODEL_YOLOV8_DETECTION, "/system/model/car.cvimodel");
 	CVI_TDL_SetModelThreshold(g_tdl_handle, CVI_TDL_SUPPORTED_MODEL_YOLOV8_DETECTION, 0.25);
 	if (s32Ret != CVI_SUCCESS) {
 		printf("open model failed with %#x!\n", s32Ret);
@@ -470,7 +498,7 @@ int32_t ai_init(void)
 
   	memset(&g_obj_meta, 0, sizeof(cvtdl_object_t));
 
-	//线程
+	// 线程
 	pthread_t stTDLThread;
     if (pthread_create(&stTDLThread, NULL, run_tdl_thread, NULL) != 0) {
         perror("Failed to create thread");
@@ -610,7 +638,7 @@ int32_t ai_exit(void)
 	printf("111-ai_exit\n");
 	jobExit = true;
 	s_ai_init = false;
-	
+
 	return 0;
 }
 
@@ -647,10 +675,10 @@ int32_t UVC_STREAM_Start(void)
 	if (0 != ai_init())
 	{
 		printf("ai_init failed !");
-	} 
+	}
 
 	s_stUVCStreamCtx.bInited = true;
-	
+
 	return 0;
 }
 
@@ -665,7 +693,7 @@ int32_t UVC_STREAM_Stop(void)
 		s_stUVCStreamCtx.bInited = false;
 	}
 
-	//退出tdl job
+	// 退出tdl job
 	jobExit = true;
 
 	return 0;
@@ -707,12 +735,43 @@ int32_t run_ai_draw(VIDEO_FRAME_INFO_S *venc_frame){
 		// 	stHandMeta.info[i].bbox.score);
 
 		char strinfo[128];
-		sprintf(strinfo, "%s %0.2f", coco_names[stHandMeta.info[i].classes], stHandMeta.info[i].bbox.score);
+		if(stHandMeta.info[i].classes < 80)
+		{
+			sprintf(strinfo, "%s %0.2f", coco_names[stHandMeta.info[i].classes], stHandMeta.info[i].bbox.score);
+		}
+		else
+		{
+			sprintf(strinfo, "%d %0.2f", stHandMeta.info[i].classes, stHandMeta.info[i].bbox.score);
+		}
+
 		s32Ret = CVI_TDL_Service_ObjectWriteText(strinfo, stHandMeta.info[i].bbox.x1, stHandMeta.info[i].bbox.y2, venc_frame, 0, 200, 0);
 		if (s32Ret != CVI_SUCCESS) {
 			printf("##CVI_TDL_Service_ObjectWriteText failed with %#x!\n", s32Ret);
 			return s32Ret;
 		}
+		if((stHandMeta.info[i].bbox.x1 > 0 ||
+		   stHandMeta.info[i].bbox.y1 > 0 ||
+		   stHandMeta.info[i].bbox.x2 > 0 ||
+		   stHandMeta.info[i].bbox.y2 > 0) &&
+		   stHandMeta.info[i].bbox.score > 0 &&
+		   stHandMeta.info[i].bbox.score < 1)
+		{
+			char buff[128];
+			memset(buff, 0,128);
+			sprintf(buff, "type = %s, box[%f,%f], distance=100 ,score = %f\r\n",
+					coco_names[stHandMeta.info[i].classes],
+					(stHandMeta.info[i].bbox.x1 + stHandMeta.info[i].bbox.x2) /2 ,
+					(stHandMeta.info[i].bbox.y1 + stHandMeta.info[i].bbox.y2) /2 ,
+					stHandMeta.info[i].bbox.score);
+			//AUTOSOME_DEBUG("g_uart_ctx = %p", g_uart_ctx);
+			if(g_uart_ctx != NULL)
+			{
+				UartSendData(g_uart_ctx, (uint8_t*)(buff), 128);
+				//AUTOSOME_DEBUG();
+			}
+
+		}
+
 	}
 
 	char info[128];
@@ -747,14 +806,14 @@ int32_t UVC_STREAM_CopyBitStream(void *dst)
 
 	clock_gettime(CLOCK_MONOTONIC, &end);
 
-    double cost_time = (end.tv_sec - start.tv_sec) + 
+    double cost_time = (end.tv_sec - start.tv_sec) +
                      (end.tv_nsec - start.tv_nsec) / 1e6;
 
 	cost = cost_time < 0 ? cost : cost_time;
 
 
 	///////////////////////////
-	//画图
+	// 画图
 	s32Ret = run_ai_draw(&venc_frame);
 
 	int32_t s32SetFrameMilliSec = 20000;
@@ -1016,6 +1075,24 @@ UVC_CONTEXT_S *UVC_GetCtx(void)
 }
 
 
+
+int uart_init(void)
+{
+	int ret = 0;
+	ret = InitUart(&g_uart_ctx, UART_DEVICE);
+	AUTOSOME_DEBUG("ret = %d", ret);
+	return ret;
+}
+
+int uart_exit(void)
+{
+	if (g_uart_ctx != NULL)
+	{
+		DeinitUart(g_uart_ctx);
+	}
+	return 0;
+}
+
 int uvc_init(void)
 {
 	printf("111-uvc_init\n");
@@ -1035,24 +1112,28 @@ int uvc_init(void)
 	stDataSource.VprocTdlChnId = 1;
 	stDataSource.VprocHdl = 0;
 
+	if (uart_init() != 0){
+		AUTOSOME_ERROR("uart_init Failed !");
+	}
+
 	if (sys_init() != 0){
-		printf("sys_init Failed !");
+		printf("sys_init Failed !\n");
 		return -1;
 	}
 
 	if (vi_init() != 0){
-		printf("vi_init Failed !");
+		printf("vi_init Failed !\n");
 		sys_exit();
 		return -1;
 	}
 
 	if (UVC_Init(&stDeviceCap, &stDataSource, &stBuffer) != 0) {
-		printf("UVC_Init Failed !");
+		printf("UVC_Init Failed !\n");
 		goto failed;
 	}
 
 	if (UVC_Start(uvc_devname) != 0) {
-		printf("UVC_Start Failed !");
+		printf("UVC_Start Failed !\n");
 		goto failed;
 	}
 
@@ -1097,4 +1178,7 @@ void uvc_exit(void)
 
 	sys_exit();
 	printf("sys exit done\n");
+
+	uart_exit();
+	printf("uart exit done\n");
 }

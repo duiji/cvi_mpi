@@ -178,6 +178,8 @@ CVI_S32 CVI_VPSS_CreateGrp(VPSS_GRP VpssGrp, const VPSS_GRP_ATTR_S *pstGrpAttr)
 	if (s32Ret != CVI_SUCCESS) {
 		CVI_TRACE_VPSS(CVI_DBG_ERR, "Grp(%d) VpssDev(%d) create group fail\n",
 				VpssGrp, pstGrpAttr->u8VpssDev);
+		printf("--Grp(%d) VpssDev(%d) create group fail\n",
+				VpssGrp, pstGrpAttr->u8VpssDev);
 		return s32Ret;
 	}
 	// for chn rotation, ldc mesh gen
